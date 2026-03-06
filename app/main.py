@@ -2,10 +2,12 @@ from fastapi import FastAPI
 from app.api.api import api_router
 from app.core.config import settings
 from app.core.database import engine
-from app.models import user as user_model
+from app.models.user import User
+from app.models.deployment import Deployment
 
 # Create database tables
-user_model.Base.metadata.create_all(bind=engine)
+from app.core.database import Base
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
