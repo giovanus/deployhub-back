@@ -39,7 +39,7 @@ class DeploymentService:
                     for p in p_list:
                         used_ports.add(int(p.get('HostPort')))
         
-        for port in range(8000, 9000):
+        for port in range(8090, 9000):
             if port not in used_ports:
                 return port
         raise Exception("No available ports in range 8000-9000")
@@ -92,6 +92,7 @@ class DeploymentService:
                 tag=image_tag,
                 rm=True
             )
+            print(build_logs)
             
             deployment.image_id = image.id
             deployment.status = "starting"
@@ -102,7 +103,7 @@ class DeploymentService:
             container = self.docker_client.containers.run(
                 image_tag,
                 detach=True,
-                ports={'8080/tcp': host_port},
+                ports={'8000/tcp': host_port},
                 environment=env_vars,
                 name=f"deployhub-container-{deployment.id}"
             )
@@ -114,54 +115,118 @@ class DeploymentService:
             self.db.commit()
             return deployment
 
-    async def deploy_from_github(self, data: DeploymentCreateGithub):
+    async def start_github_deployment(self, data: DeploymentCreateGithub):
+        deployment = Deployment(
+            name=data.name,
+            source_type="github",
+            source_url=data.github_url,
+            status="pending",
+            env_vars=data.env_vars
+        )
+        self.db.add(deployment)
+        self.db.commit()
+        self.db.refresh(deployment)
+        return deployment
+
+    async def start_zip_deployment(self, name: str, zip_path: str, env_vars: dict = None):
+        deployment = Deployment(
+            name=name,
+            source_type="zip",
+            status="pending",
+            source_url=zip_path,  # Storing the temp path temporarily
+            env_vars=env_vars
+        )
+        self.db.add(deployment)
+        self.db.commit()
+        self.db.refresh(deployment)
+        return deployment
+
+    async def execute_deployment(self, deployment_id: int):
+        deployment = self.db.query(Deployment).filter(Deployment.id == deployment_id).first()
+        if not deployment:
+            raise ValueError(f"Deployment {deployment_id} not found")
+
         temp_dir = self._create_temp_dir()
         try:
-            deployment = Deployment(
-                name=data.name,
-                source_type="github",
-                source_url=data.github_url,
-                status="cloning",
-                env_vars=data.env_vars
-            )
-            self.db.add(deployment)
-            self.db.commit()
-            self.db.refresh(deployment)
+            if deployment.source_type == "github":
+                deployment.status = "cloning"
+                self.db.commit()
+                git.Repo.clone_from(deployment.source_url, temp_dir)
+            else:
+                deployment.status = "extracting"
+                self.db.commit()
+                with zipfile.ZipFile(deployment.source_url, "r") as zip_ref:
+                    zip_ref.extractall(temp_dir)
 
-            git.Repo.clone_from(data.github_url, temp_dir, branch=data.branch)
-            
-            return await self._execute_deployment(deployment, temp_dir, data.env_vars)
+            return await self._execute_deployment_logic(deployment, temp_dir, deployment.env_vars)
 
         except Exception as e:
-            if 'deployment' in locals():
-                deployment.status = "failed"
-                self.db.commit()
+            deployment.status = "failed"
+            self.db.commit()
             raise e
         finally:
             shutil.rmtree(temp_dir)
 
-    async def deploy_from_zip(self, name: str, zip_path: str, env_vars: dict = None):
-        temp_dir = self._create_temp_dir()
-        try:
-            deployment = Deployment(
-                name=name,
-                source_type="zip",
-                status="extracting",
-                env_vars=env_vars
-            )
-            self.db.add(deployment)
+    async def _execute_deployment_logic(self, deployment: Deployment, path: str, env_vars: dict = None):
+        compose_file = self._get_compose_file(path)
+        
+        if compose_file:
+            deployment.is_compose = True
+            deployment.status = "deploying_compose"
             self.db.commit()
-            self.db.refresh(deployment)
-
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(temp_dir)
             
-            return await self._execute_deployment(deployment, temp_dir, env_vars)
-
-        except Exception as e:
-            if 'deployment' in locals():
+            project_name = f"deployhub-{deployment.id}"
+            try:
+                env = os.environ.copy()
+                if env_vars:
+                    env.update({k: str(v) for k, v in env_vars.items()})
+                
+                subprocess.run(
+                    ["docker", "compose", "-p", project_name, "up", "-d", "--build"],
+                    cwd=path,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=env
+                )
+                
+                deployment.status = "running"
+                deployment.app_url = f"Compose: {project_name}"
+                self.db.commit()
+                return deployment
+            except subprocess.CalledProcessError as e:
                 deployment.status = "failed"
                 self.db.commit()
-            raise e
-        finally:
-            shutil.rmtree(temp_dir)
+                raise Exception(f"Docker Compose failed: {e.stderr}")
+        else:
+            self._validate_dockerfile(path)
+            deployment.status = "building"
+            self.db.commit()
+            
+            image_tag = f"deployhub-{deployment.id}"
+            image, build_logs = self.docker_client.images.build(
+                path=path,
+                tag=image_tag,
+                rm=True
+            )
+            
+            deployment.image_id = image.id
+            deployment.status = "starting"
+            self.db.commit()
+            
+            host_port = self._get_available_port()
+            
+            container = self.docker_client.containers.run(
+                image_tag,
+                detach=True,
+                ports={'8000/tcp': host_port},
+                environment=env_vars,
+                name=f"deployhub-container-{deployment.id}"
+            )
+            
+            deployment.container_id = container.id
+            deployment.port = host_port
+            deployment.status = "running"
+            deployment.app_url = f"http://localhost:{host_port}"
+            self.db.commit()
+            return deployment
